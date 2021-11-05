@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -21,6 +22,7 @@ var searchCmd = &cobra.Command{
 		list := exec.Command("go", "list", "-json", args[0])
 		output := new(bytes.Buffer)
 		list.Stdout = output
+		list.Stderr = os.Stderr
 		if err := list.Run(); err != nil {
 			log.Fatal(err)
 		}
@@ -31,6 +33,7 @@ var searchCmd = &cobra.Command{
 		jq := exec.Command("jq", "-c")
 		jq.Stdin = output
 		jq.Stdout = minified
+		jq.Stderr = os.Stderr
 		if err := jq.Run(); err != nil {
 			log.Fatal("jq error: " + err.Error())
 		}

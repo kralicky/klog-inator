@@ -13,6 +13,9 @@ import (
 	"sync"
 )
 
+type SearchList []*LogStatement
+type SearchMap map[string]*LogStatement
+
 type klogFunctionMeta struct {
 	Severity        int32
 	FormatStringPos int
@@ -44,6 +47,34 @@ var severityMap = map[string]klogFunctionMeta{
 	"ExitDepth":    {Severity: 3, FormatStringPos: 1, MinArgs: 1},
 	"Exitln":       {Severity: 3, FormatStringPos: 0},
 	"Exitf":        {Severity: 3, FormatStringPos: 0, MinArgs: 1},
+}
+
+func LoadSearchList(filename string) (SearchList, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var list []*LogStatement
+	dec := json.NewDecoder(f)
+	if err := dec.Decode(&list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+func (s SearchList) GenerateSearchMap() (sm SearchMap, collisions []*LogStatement) {
+	sm = SearchMap{}
+	for _, stmt := range s {
+		fp := stmt.Fingerprint()
+		if _, ok := sm[fp]; !ok {
+			sm[fp] = stmt
+		} else {
+			collisions = append(collisions, stmt)
+		}
+	}
+	return
 }
 
 func Search(jsonObjects []string) <-chan *LogStatement {
@@ -186,7 +217,7 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 								FormatString: stringLiteralFmtArg,
 							}
 							logStatements <- &stmt
-							return true
+							return false
 						case *ast.CallExpr:
 							// In this case, the following must be true of the CallExpr:
 							// 1. It has len(Args)==1 and Args[0] is a BasicLit containing an INT value
@@ -235,7 +266,7 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 								FormatString: stringLiteralFmtArg,
 							}
 							logStatements <- &stmt
-							return true
+							return false
 						}
 						return true
 					})

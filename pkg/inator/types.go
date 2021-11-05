@@ -1,6 +1,13 @@
 package inator
 
-import "golang.org/x/tools/go/packages"
+import (
+	"crypto/sha1"
+	"encoding/hex"
+	"path/filepath"
+	"strconv"
+
+	"golang.org/x/tools/go/packages"
+)
 
 type LogStatement struct {
 	SourceFile   string `json:"sourceFile"`
@@ -8,6 +15,31 @@ type LogStatement struct {
 	Severity     int32  `json:"severity"`
 	Verbosity    *int   `json:"verbosity,omitempty"`
 	FormatString string `json:"formatString,omitempty"`
+}
+
+type ParsedLog struct {
+	SourceFile string `json:"sourceFile"`
+	LineNumber int    `json:"lineNumber"`
+	Severity   int32  `json:"severity"`
+	Message    string `json:"message"`
+}
+
+func (s LogStatement) Fingerprint() string {
+	// To compute the fingerprint, hash the source file name with its immediate
+	// parent directory, the line number, and severity.
+	h := sha1.New()
+	h.Write([]byte(filepath.Join(filepath.Base(filepath.Dir(s.SourceFile)), filepath.Base(s.SourceFile))))
+	h.Write([]byte(strconv.Itoa(s.LineNumber)))
+	h.Write([]byte(strconv.Itoa(int(s.Severity))))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (s ParsedLog) Fingerprint() string {
+	h := sha1.New()
+	h.Write([]byte(s.SourceFile))
+	h.Write([]byte(strconv.Itoa(s.LineNumber)))
+	h.Write([]byte(strconv.Itoa(int(s.Severity))))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 type internalPackage struct {
