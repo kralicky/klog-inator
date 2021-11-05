@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+	"time"
 
 	"github.com/kralicky/klog-inator/pkg/inator"
 	"github.com/spf13/cobra"
@@ -19,14 +21,52 @@ var matchCmd = &cobra.Command{
 		if err != nil {
 			panic(err)
 		}
+		fmt.Printf("Loaded search list with %d logs\n", len(sl))
+		fmt.Println("Computing log fingerprints...")
 		sm, collisions := sl.GenerateSearchMap()
-		fmt.Printf("%d fingerprinted logs\n", len(sm))
-		fmt.Printf("%d collisions\n", len(collisions))
+		fmt.Printf("=> Computed %d unique log fingerprints\n", len(sm))
+		fmt.Printf("=> %d collisions\n", len(collisions))
 
-		results := inator.Match(sm, logArchive)
+		startTime := time.Now()
+		results, err := inator.Match(sm, logArchive)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		duration := time.Since(startTime)
+		fmt.Printf("=> Processed %d logs in %s (%d logs/s)\n",
+			results.NumMatched+results.NumNotMatched,
+			duration.Round(time.Millisecond),
+			int64(float64(results.NumMatched)/duration.Seconds()))
+		fmt.Printf("=> %d logs matched\n", results.NumMatched)
+		fmt.Printf("=> %d logs not matched\n", results.NumNotMatched)
 
-		hit, _ := inator.AnalyzeResults(sm, results)
-		fmt.Printf("Hit %.2f%% of log statements\n", hit*100)
+		fmt.Println("Aggregating results...")
+		aggregated := inator.AggregateResults(results.Matches)
+
+		hit, _ := inator.AnalyzeMatches(sm, aggregated)
+		fmt.Printf("=> Hit %.2f%% of log statements\n", hit*100)
+
+		sorted := inator.SortMatches(aggregated)
+		fmt.Println("=> Top 10 matches:")
+		maxHitsLen := 0
+		maxFilenameLen := 0
+		for i := 0; i < 10; i++ {
+			if l := len(fmt.Sprint(len(sorted[i].Hits))); l > maxHitsLen {
+				maxHitsLen = l
+			}
+			if l := len(sorted[i].Log.ShortSourceFile()); l > maxFilenameLen {
+				maxFilenameLen = l
+			}
+		}
+		for i := 0; i < 10; i++ {
+			fmt.Printf("%2d [%*d hits]: %*s: %s\n",
+				i+1,
+				maxHitsLen, len(sorted[i].Hits),
+				maxFilenameLen, sorted[i].Log.ShortSourceFile(),
+				sorted[i].Log.FormatString,
+			)
+		}
 	},
 }
 

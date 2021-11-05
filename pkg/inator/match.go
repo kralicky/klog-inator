@@ -2,16 +2,17 @@ package inator
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"sync"
 
 	"go.uber.org/atomic"
-
-	"github.com/sirupsen/logrus"
 )
 
 func parseLine(line []byte) (ls ParsedLog, ok bool) {
@@ -191,13 +192,13 @@ func scanner(lines <-chan []byte, parsedLines chan<- ParsedLog) {
 	}
 }
 
-var numMatched = atomic.NewInt32(0)
-var numNotMatched = atomic.NewInt32(0)
+var numMatched = atomic.NewInt64(0)
+var numNotMatched = atomic.NewInt64(0)
 
-type MatcherResults = map[*LogStatement]*[]ParsedLog
+type Matches = map[*LogStatement]*[]ParsedLog
 
-func matcher(sm SearchMap, parsed <-chan ParsedLog) MatcherResults {
-	matched := MatcherResults{}
+func matcher(sm SearchMap, parsed <-chan ParsedLog) Matches {
+	matched := Matches{}
 	for p := range parsed {
 		fp := p.Fingerprint()
 		if stmt, ok := sm[fp]; ok {
@@ -214,74 +215,130 @@ func matcher(sm SearchMap, parsed <-chan ParsedLog) MatcherResults {
 	return matched
 }
 
-func Match(sm SearchMap, archive string) MatcherResults {
+type MatchResults struct {
+	Matches       []Matches
+	NumMatched    int64
+	NumNotMatched int64
+}
+
+func Match(sm SearchMap, archive string) (MatchResults, error) {
 	workerCount := runtime.NumCPU()
+	workersPerGroup := 4
+	channelGroups := make([]struct {
+		Lines       chan []byte
+		ParsedLines chan ParsedLog
+	}, workerCount/workersPerGroup)
+	s := "s"
+	if len(channelGroups) == 1 {
+		s = ""
+	}
+	fmt.Printf("Processing archive in %d chunk%s using %d workers\n", len(channelGroups), s, workerCount)
+	scannerWg := sync.WaitGroup{}
+	scannerWg.Add(workerCount)
+	matcherWg := sync.WaitGroup{}
+	matcherWg.Add(workerCount)
 
-	wg := sync.WaitGroup{}
-	wg.Add(workerCount)
-	defer wg.Wait()
-
-	lines := make(chan []byte, workerCount)
-	parsed := make(chan ParsedLog, workerCount)
+	for i := 0; i < len(channelGroups); i++ {
+		channelGroups[i].Lines = make(chan []byte, workerCount)
+		channelGroups[i].ParsedLines = make(chan ParsedLog, workerCount)
+	}
 	go func() {
-		wg.Wait()
-		close(parsed)
+		scannerWg.Wait()
+		for _, group := range channelGroups {
+			close(group.ParsedLines)
+		}
 	}()
 
+	results := make(chan Matches, workerCount)
+
 	for i := 0; i < workerCount; i++ {
-		go func() {
-			defer wg.Done()
-			scanner(lines, parsed)
-		}()
+		go func(lines <-chan []byte, parsedLines chan<- ParsedLog) {
+			defer scannerWg.Done()
+			scanner(lines, parsedLines)
+		}(channelGroups[i%len(channelGroups)].Lines,
+			channelGroups[i%len(channelGroups)].ParsedLines)
+		go func(parsedLines <-chan ParsedLog) {
+			defer matcherWg.Done()
+			results <- matcher(sm, parsedLines)
+		}(channelGroups[i%len(channelGroups)].ParsedLines)
 	}
 
 	f, err := os.Open(archive)
+	info, _ := f.Stat()
 	if err != nil {
-		logrus.Error(err)
-		return nil
+		return MatchResults{}, err
 	}
 	defer f.Close()
+	buf := make([]byte, info.Size())
+	n, err := io.ReadFull(f, buf)
+	if err != nil || n != len(buf) {
+		panic("could not read archive")
+	}
+	// chunk the file into len(channelGroups) chunks, cleanly separated by newlines
+	chunkSize := len(buf) / len(channelGroups)
 
-	wg2 := sync.WaitGroup{}
-	wg2.Add(workerCount)
-	results := make(chan MatcherResults, workerCount)
-	for i := 0; i < workerCount; i++ {
-		go func() {
-			defer wg2.Done()
-			results <- matcher(sm, parsed)
-		}()
+	readerWg := sync.WaitGroup{}
+	readerWg.Add(len(channelGroups))
+	seekPos := 0
+	for i := 0; i < len(channelGroups); i++ {
+		startByte := seekPos
+		seekPos += chunkSize
+		if seekPos > len(buf)-1 {
+			seekPos = len(buf) - 1
+		}
+		for seekPos <= len(buf)-1 && buf[seekPos] != '\n' {
+			seekPos++
+		}
+		if seekPos < len(buf)-1 {
+			seekPos++
+		}
+		chunk := buf[startByte:seekPos]
+		//fmt.Printf("Chunk %d: %d bytes [%d:%d]\n", i, len(chunk), startByte, seekPos)
+		go func(chunk []byte, linesCh chan []byte) {
+			defer readerWg.Done()
+			scan := bufio.NewScanner(bytes.NewReader(chunk))
+			for scan.Scan() {
+				line := []byte(scan.Text())
+				linesCh <- line
+			}
+			if err := scan.Err(); err != nil {
+				panic(err)
+			}
+			close(linesCh)
+		}(chunk, channelGroups[i].Lines)
 	}
+	readerWg.Wait()
+	scannerWg.Wait()
+	matcherWg.Wait()
 
-	scan := bufio.NewScanner(f)
-	for scan.Scan() {
-		line := []byte(scan.Text())
-		lines <- line
-	}
-	close(lines)
-	if err := scan.Err(); err != nil {
-		logrus.Error(err)
-	}
-	wg2.Wait()
 	close(results)
-	fmt.Println("done.")
-	fmt.Println("matched:", numMatched.Load())
-	fmt.Println("not matched:", numNotMatched.Load())
 
-	merged := MatcherResults{}
-	for r := range results {
-		for k, v := range r {
-			if s, ok := merged[k]; !ok {
-				merged[k] = v
+	matches := []Matches{}
+	for match := range results {
+		matches = append(matches, match)
+	}
+	return MatchResults{
+		Matches:       matches,
+		NumMatched:    numMatched.Load(),
+		NumNotMatched: numNotMatched.Load(),
+	}, nil
+}
+
+func AggregateResults(results []Matches) Matches {
+	first := results[0]
+	for _, result := range results[1:] {
+		for k, v := range result {
+			if s, ok := first[k]; !ok {
+				first[k] = v
 			} else {
 				*s = append(*s, *v...)
 			}
 		}
 	}
-
-	return merged
+	return first
 }
 
-func AnalyzeResults(sm SearchMap, results MatcherResults) (hit, missed float64) {
+func AnalyzeMatches(sm SearchMap, results Matches) (hit, missed float64) {
 	numHit := 0
 	numMissed := 0
 	for _, v := range sm {
@@ -294,4 +351,26 @@ func AnalyzeResults(sm SearchMap, results MatcherResults) (hit, missed float64) 
 	}
 
 	return float64(numHit) / float64(len(sm)), float64(numMissed) / float64(len(sm))
+}
+
+type MatchEntry struct {
+	Log  *LogStatement
+	Hits []ParsedLog
+}
+
+// Sorts matches by number of hits
+func SortMatches(results Matches) []MatchEntry {
+	entries := make([]MatchEntry, 0, len(results))
+	for k, v := range results {
+		entries = append(entries, MatchEntry{
+			Log:  k,
+			Hits: *v,
+		})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return len(entries[i].Hits) > len(entries[j].Hits)
+	})
+
+	return entries
 }

@@ -24,11 +24,15 @@ type ParsedLog struct {
 	Message    string `json:"message"`
 }
 
+func (s LogStatement) ShortSourceFile() string {
+	return filepath.Join(filepath.Base(filepath.Dir(s.SourceFile)), filepath.Base(s.SourceFile))
+}
+
 func (s LogStatement) Fingerprint() string {
 	// To compute the fingerprint, hash the source file name with its immediate
 	// parent directory, the line number, and severity.
 	h := sha1.New()
-	h.Write([]byte(filepath.Join(filepath.Base(filepath.Dir(s.SourceFile)), filepath.Base(s.SourceFile))))
+	h.Write([]byte(s.ShortSourceFile()))
 	h.Write([]byte(strconv.Itoa(s.LineNumber)))
 	h.Write([]byte(strconv.Itoa(int(s.Severity))))
 	return hex.EncodeToString(h.Sum(nil))
