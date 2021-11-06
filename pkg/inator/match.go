@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -15,7 +14,7 @@ import (
 	"go.uber.org/atomic"
 )
 
-func parseLine(line []byte) (ls ParsedLog, ok bool) {
+func ParseLine(line []byte) (ls ParsedLog, ok bool) {
 	// we are looking for a very specific format:
 	// Lmmdd hh:mm:ss.uuuuuu thread# file:line] <message>
 	// [-------------29------------]
@@ -110,64 +109,50 @@ func parseLine(line []byte) (ls ParsedLog, ok bool) {
 		}
 	}
 
-	// space
-	if line[29] != ' ' {
-		return
-	}
-
 	// dir/file:
 	index := 30
-	dir := make([]byte, 0, 255)
-	file := make([]byte, 0, 255)
-	success := false
-	temp := make([]byte, 0, 255)
+	dirStart := 30
+	var dirEnd, fileStart, fileEnd int
+
 FILENAME:
-	for ; index < len(line); index++ {
+	for ; index < len(line)-1; index++ {
 		switch c := line[index]; {
 		case c == '.' || c == '-' || c == '_' ||
 			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 			(c >= '0' && c <= '9'):
-			temp = append(temp, c)
 		case c == '/':
-			dir = append(dir, temp...)
-			temp = make([]byte, 0, 255)
+			dirEnd = index
+			fileStart = index + 1
 		case c == ':':
-			file = append(file, temp...)
-			success = true
+			fileEnd = index
 			break FILENAME
 		default:
 			break FILENAME
 		}
 	}
-	if !success {
+	if index == len(line)-1 || dirEnd-dirStart < 1 ||
+		fileStart != dirEnd+1 || fileEnd-fileStart < 1 {
 		return
 	}
-	ls.SourceFile = filepath.Join(string(dir), string(file))
 	index++
 
 	// lineNumber]
-	lineNumber := make([]byte, 0, 255)
-	success = false
+	lineNumStart := index
+	var lineNumEnd int
 LINENUMBER:
-	for ; index < len(line); index++ {
+	for ; index < len(line)-1; index++ {
 		switch c := line[index]; {
-		case c == ']':
-			success = len(lineNumber) > 0
-			break LINENUMBER
 		case c >= '0' && c <= '9':
-			lineNumber = append(lineNumber, c)
+		case c == ']':
+			lineNumEnd = index
+			break LINENUMBER
 		default:
 			break LINENUMBER
 		}
 	}
-	if !success {
+	if index == len(line)-1 || lineNumEnd-lineNumStart < 1 {
 		return
 	}
-	num, err := strconv.Atoi(string(lineNumber))
-	if err != nil {
-		return
-	}
-	ls.LineNumber = num
 	index++
 
 	// space
@@ -177,15 +162,22 @@ LINENUMBER:
 	index++
 
 	// message
-	message := line[index:]
-	ls.Message = string(message)
+	messageStart := index
+	messageEnd := len(line) - 1
+	var err error
+	ls.LineNumber, err = strconv.Atoi(string(line[lineNumStart:lineNumEnd]))
+	if err != nil {
+		ok = false
+	}
+	ls.SourceFile = string(line[dirStart:fileEnd])
+	ls.Message = string(line[messageStart:messageEnd])
 	ok = true
 	return
 }
 
 func scanner(lines <-chan []byte, parsedLines chan<- ParsedLog) {
 	for line := range lines {
-		logStmt, ok := parseLine(line)
+		logStmt, ok := ParseLine(line)
 		if ok {
 			parsedLines <- logStmt
 		}

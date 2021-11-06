@@ -48,9 +48,13 @@ var matchCmd = &cobra.Command{
 		fmt.Printf("=> Hit %.2f%% of log statements\n", hit*100)
 
 		sorted := inator.SortMatches(aggregated)
+		if len(sorted) == 0 {
+			return
+		}
 		fmt.Println("=> Top 10 matches:")
 		maxHitsLen := 0
 		maxFilenameLen := 0
+
 		for i := 0; i < 10; i++ {
 			if l := len(fmt.Sprint(len(sorted[i].Hits))); l > maxHitsLen {
 				maxHitsLen = l
