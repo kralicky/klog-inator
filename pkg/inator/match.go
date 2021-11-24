@@ -202,12 +202,12 @@ var numNotMatched = atomic.NewInt64(0)
 type Matches = map[*LogStatement]*[]ParsedLog
 
 func matcher(sm SearchMap, parsed <-chan ParsedLog) Matches {
-	matched := Matches{}
+	hit := Matches{}
 	for p := range parsed {
 		fp := p.Fingerprint()
 		if stmt, ok := sm[fp]; ok {
-			if s, ok := matched[stmt]; !ok {
-				matched[stmt] = &[]ParsedLog{p}
+			if s, ok := hit[stmt]; !ok {
+				hit[stmt] = &[]ParsedLog{p}
 			} else {
 				*s = append(*s, p)
 			}
@@ -216,11 +216,17 @@ func matcher(sm SearchMap, parsed <-chan ParsedLog) Matches {
 			numNotMatched.Add(1)
 		}
 	}
-	return matched
+	return hit
+}
+
+type MatchedAndNotMatchedLogs struct {
+	Matched    Matches
+	NotMatched Matches
 }
 
 type MatchResults struct {
-	Matches       []Matches
+	Matched       []Matches
+	NotMatched    []Matches
 	NumMatched    int64
 	NumNotMatched int64
 }
@@ -304,12 +310,12 @@ func Match(sm SearchMap, archive string, opts ...MatchOption) (MatchResults, err
 
 	close(results)
 
-	matches := []Matches{}
+	hit := []Matches{}
 	for match := range results {
-		matches = append(matches, match)
+		hit = append(hit, match)
 	}
 	return MatchResults{
-		Matches:       matches,
+		Matched:       hit,
 		NumMatched:    numMatched.Load(),
 		NumNotMatched: numNotMatched.Load(),
 	}, nil
@@ -327,6 +333,16 @@ func AggregateResults(results []Matches) Matches {
 		}
 	}
 	return first
+}
+
+func FindMissed(sm SearchMap, aggregated Matches) Matches {
+	missed := Matches{}
+	for _, v := range sm {
+		if _, ok := aggregated[v]; !ok {
+			missed[v] = nil
+		}
+	}
+	return missed
 }
 
 type AnalyzeResult struct {
@@ -416,12 +432,20 @@ func SortMatches(results Matches) []MatchEntry {
 	entries := make([]MatchEntry, 0, len(results))
 	for k, v := range results {
 		entries = append(entries, MatchEntry{
-			Log:  k,
-			Hits: *v,
+			Log: k,
+			Hits: func(v *[]ParsedLog) []ParsedLog {
+				if v == nil {
+					return []ParsedLog{}
+				}
+				return *v
+			}(v),
 		})
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
+		if len(entries[i].Hits) == len(entries[j].Hits) {
+			return entries[i].Log.SourceFile > entries[j].Log.SourceFile
+		}
 		return len(entries[i].Hits) > len(entries[j].Hits)
 	})
 

@@ -13,6 +13,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var excludeModules, excludeFilenames, errorKeywords []string
+
 // searchCmd represents the search command
 var searchCmd = &cobra.Command{
 	Use:   "search [pattern]",
@@ -41,7 +43,11 @@ var searchCmd = &cobra.Command{
 		if objects[len(objects)-1] == "" {
 			objects = objects[:len(objects)-1]
 		}
-		statements := inator.Search(objects)
+		statements := inator.Search(objects,
+			excludeModules,
+			append(excludeFilenames, "_test.go"),
+			errorKeywords,
+		)
 		printJson, _ := cmd.Flags().GetBool("json")
 		if printJson {
 			statementSlice := []*inator.LogStatement{}
@@ -82,6 +88,8 @@ var searchCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(searchCmd)
-
+	searchCmd.Flags().StringSliceVar(&excludeModules, "exclude-modules", []string{}, "Modules to exclude (substrings)")
+	searchCmd.Flags().StringSliceVar(&excludeFilenames, "exclude-filenames", []string{}, "Filenames to exclude (substrings)")
+	searchCmd.Flags().StringSliceVar(&errorKeywords, "error-keywords", []string{}, "Treat log messages containing these keywords as errors, if they are logged as Info")
 	searchCmd.Flags().Bool("json", false, "Print results in json format")
 }

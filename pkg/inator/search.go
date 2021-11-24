@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -81,7 +82,44 @@ func (s SearchList) GenerateSearchMap() (sm SearchMap, collisions map[string][]*
 	return
 }
 
-func Search(jsonObjects []string) <-chan *LogStatement {
+func resolveSeverity(
+	message string,
+	severity Severity,
+	errorKeywords []string,
+) (newSeverity Severity) {
+	if severity != SeverityInfo {
+		return severity
+	}
+	defer func() {
+		if newSeverity == SeverityError {
+			fmt.Fprintf(os.Stderr, "Treating info message as error: %s\n", message)
+		}
+	}()
+	unquoted := strings.ToLower(strings.Trim(message, ` "`))
+	for _, keyword := range errorKeywords {
+		if keyword[0] == '^' {
+			if strings.HasPrefix(unquoted, strings.ToLower(keyword[1:])) {
+				return SeverityError
+			}
+		} else if keyword[len(keyword)-1] == '$' {
+			if strings.HasSuffix(unquoted, strings.ToLower(keyword[:len(keyword)-1])) {
+				return SeverityError
+			}
+		} else {
+			if strings.Contains(unquoted, strings.ToLower(keyword)) {
+				return SeverityError
+			}
+		}
+	}
+	return SeverityInfo
+}
+
+func Search(
+	jsonObjects []string,
+	excludeModules []string,
+	excludeFilenames []string,
+	errorKeywords []string,
+) <-chan *LogStatement {
 	wd, err := os.Getwd()
 	if err != nil {
 		log.Fatal(err)
@@ -101,6 +139,12 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 			for _, im := range pkg.Imports {
 				if im == "k8s.io/klog/v2" {
 					klogFound = true
+				}
+			}
+			for _, exclude := range excludeModules {
+				if strings.Contains(pkg.ImportPath, exclude) {
+					fmt.Fprintf(os.Stderr, "Excluding package %s\n", pkg.ImportPath)
+					return
 				}
 			}
 			if klogFound {
@@ -127,6 +171,12 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 			defer wg.Done()
 			fileset := token.NewFileSet()
 			for _, file := range pkgWithLog.GoFiles {
+				for _, exclude := range excludeFilenames {
+					if strings.Contains(file, exclude) {
+						fmt.Fprintf(os.Stderr, "Excluding file %s\n", file)
+						return
+					}
+				}
 				f, err := parser.ParseFile(fileset, filepath.Join(pkgWithLog.Dir, file), nil, parser.ParseComments)
 				if err != nil {
 					log.Fatal("error parsing file: " + err.Error())
@@ -215,9 +265,13 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 
 							// This is a klog call of form 1
 							stmt := LogStatement{
-								SourceFile:   relPath,
-								LineNumber:   fileset.Position(call.Pos()).Line,
-								Severity:     Severity(meta.Severity),
+								SourceFile: relPath,
+								LineNumber: fileset.Position(call.Pos()).Line,
+								Severity: resolveSeverity(
+									stringLiteralFmtArg,
+									Severity(meta.Severity),
+									errorKeywords,
+								),
 								FormatString: stringLiteralFmtArg,
 							}
 							logStatements <- &stmt
@@ -263,9 +317,13 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 
 							// This is a klog call of form 2
 							stmt := LogStatement{
-								SourceFile:   relPath,
-								LineNumber:   fileset.Position(call.Pos()).Line,
-								Severity:     Severity(meta.Severity), // in practice, this is always 0
+								SourceFile: relPath,
+								LineNumber: fileset.Position(call.Pos()).Line,
+								Severity: resolveSeverity(
+									stringLiteralFmtArg,
+									Severity(meta.Severity),
+									errorKeywords,
+								),
 								Verbosity:    verbosity,
 								FormatString: stringLiteralFmtArg,
 							}
