@@ -1,16 +1,15 @@
 package inator
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"runtime"
 	"sort"
 	"strconv"
 	"sync"
 
+	"github.com/kralicky/klog-inator/pkg/fast"
+	"github.com/valyala/fastjson"
 	"go.uber.org/atomic"
 )
 
@@ -19,7 +18,7 @@ func ParseLine(line []byte) (ls ParsedLog, ok bool) {
 	// Lmmdd hh:mm:ss.uuuuuu thread# file:line] <message>
 	// [-------------29------------]
 
-	if len(line) < 29 {
+	if len(line) <= 29 {
 		return
 	}
 
@@ -175,11 +174,24 @@ LINENUMBER:
 	return
 }
 
-func scanner(lines <-chan []byte, parsedLines chan<- ParsedLog) {
-	for line := range lines {
-		logStmt, ok := ParseLine(line)
-		if ok {
-			parsedLines <- logStmt
+func scanner(lines <-chan []byte, parsedLines chan<- ParsedLog, jsonField string) {
+	if jsonField == "" {
+		for line := range lines {
+			logStmt, ok := ParseLine(line)
+			if ok {
+				parsedLines <- logStmt
+			}
+		}
+	} else {
+		for line := range lines {
+			msg := fastjson.GetBytes(line, jsonField)
+			if msg == nil {
+				continue
+			}
+			logStmt, ok := ParseLine(msg)
+			if ok {
+				parsedLines <- logStmt
+			}
 		}
 	}
 }
@@ -213,7 +225,28 @@ type MatchResults struct {
 	NumNotMatched int64
 }
 
-func Match(sm SearchMap, archive string) (MatchResults, error) {
+type MatchOptions struct {
+	jsonField string
+}
+
+type MatchOption func(*MatchOptions)
+
+func (o *MatchOptions) Apply(opts ...MatchOption) {
+	for _, op := range opts {
+		op(o)
+	}
+}
+
+func WithJSONField(field string) MatchOption {
+	return func(o *MatchOptions) {
+		o.jsonField = field
+	}
+}
+
+func Match(sm SearchMap, archive string, opts ...MatchOption) (MatchResults, error) {
+	options := MatchOptions{}
+	options.Apply(opts...)
+
 	workerCount := runtime.NumCPU()
 	workersPerGroup := 4
 	channelGroups := make([]struct {
@@ -224,7 +257,10 @@ func Match(sm SearchMap, archive string) (MatchResults, error) {
 	if len(channelGroups) == 1 {
 		s = ""
 	}
-	fmt.Printf("Processing archive in %d chunk%s using %d workers\n", len(channelGroups), s, workerCount)
+	info, _ := os.Lstat(archive)
+	fmt.Printf("Processing %.2fGB archive in %d chunk%s using %d workers\n",
+		float64(info.Size())/1024.0/1024.0/1024.0,
+		len(channelGroups), s, workerCount)
 	scannerWg := sync.WaitGroup{}
 	scannerWg.Add(workerCount)
 	matcherWg := sync.WaitGroup{}
@@ -246,7 +282,7 @@ func Match(sm SearchMap, archive string) (MatchResults, error) {
 	for i := 0; i < workerCount; i++ {
 		go func(lines <-chan []byte, parsedLines chan<- ParsedLog) {
 			defer scannerWg.Done()
-			scanner(lines, parsedLines)
+			scanner(lines, parsedLines, options.jsonField)
 		}(channelGroups[i%len(channelGroups)].Lines,
 			channelGroups[i%len(channelGroups)].ParsedLines)
 		go func(parsedLines <-chan ParsedLog) {
@@ -255,51 +291,14 @@ func Match(sm SearchMap, archive string) (MatchResults, error) {
 		}(channelGroups[i%len(channelGroups)].ParsedLines)
 	}
 
-	f, err := os.Open(archive)
-	info, _ := f.Stat()
-	if err != nil {
+	channels := make([]chan []byte, len(channelGroups))
+	for i := 0; i < len(channels); i++ {
+		channels[i] = channelGroups[i].Lines
+	}
+	if err := fast.ReadLines(archive, channels); err != nil {
 		return MatchResults{}, err
 	}
-	defer f.Close()
-	buf := make([]byte, info.Size())
-	n, err := io.ReadFull(f, buf)
-	if err != nil || n != len(buf) {
-		panic("could not read archive")
-	}
-	// chunk the file into len(channelGroups) chunks, cleanly separated by newlines
-	chunkSize := len(buf) / len(channelGroups)
 
-	readerWg := sync.WaitGroup{}
-	readerWg.Add(len(channelGroups))
-	seekPos := 0
-	for i := 0; i < len(channelGroups); i++ {
-		startByte := seekPos
-		seekPos += chunkSize
-		if seekPos > len(buf)-1 {
-			seekPos = len(buf) - 1
-		}
-		for seekPos <= len(buf)-1 && buf[seekPos] != '\n' {
-			seekPos++
-		}
-		if seekPos < len(buf)-1 {
-			seekPos++
-		}
-		chunk := buf[startByte:seekPos]
-		//fmt.Printf("Chunk %d: %d bytes [%d:%d]\n", i, len(chunk), startByte, seekPos)
-		go func(chunk []byte, linesCh chan []byte) {
-			defer readerWg.Done()
-			scan := bufio.NewScanner(bytes.NewReader(chunk))
-			for scan.Scan() {
-				line := []byte(scan.Text())
-				linesCh <- line
-			}
-			if err := scan.Err(); err != nil {
-				panic(err)
-			}
-			close(linesCh)
-		}(chunk, channelGroups[i].Lines)
-	}
-	readerWg.Wait()
 	scannerWg.Wait()
 	matcherWg.Wait()
 
@@ -330,19 +329,81 @@ func AggregateResults(results []Matches) Matches {
 	return first
 }
 
-func AnalyzeMatches(sm SearchMap, results Matches) (hit, missed float64) {
-	numHit := 0
-	numMissed := 0
+type AnalyzeResult struct {
+	NumHitTotal     int64
+	NumMissedTotal  int64
+	PercentHitTotal float64
+	NumInfoHit      map[int]int64
+	NumInfoMissed   map[int]int64
+	PercentInfoHit  map[int]float64
+	NumWarnHit      int64
+	NumWarnMissed   int64
+	PercentWarnHit  float64
+	NumErrorHit     map[int]int64
+	NumErrorMissed  map[int]int64
+	PercentErrorHit map[int]float64
+	NumFatalHit     int64
+	NumFatalMissed  int64
+	PercentFatalHit float64
+}
+
+func AnalyzeMatches(sm SearchMap, results Matches) AnalyzeResult {
+	result := AnalyzeResult{
+		NumInfoHit:      make(map[int]int64),
+		NumInfoMissed:   make(map[int]int64),
+		PercentInfoHit:  make(map[int]float64),
+		NumErrorHit:     make(map[int]int64),
+		NumErrorMissed:  make(map[int]int64),
+		PercentErrorHit: make(map[int]float64),
+	}
 	for _, v := range sm {
 		matched, ok := results[v]
-		if !ok || matched == nil {
-			numMissed++
+		verbosity := -1
+		if v.Verbosity != nil {
+			verbosity = *v.Verbosity
+		}
+		if !ok || matched == nil || len(*matched) == 0 {
+			result.NumMissedTotal++
+			switch v.Severity {
+			case SeverityInfo:
+				result.NumInfoMissed[verbosity]++
+			case SeverityWarning:
+				result.NumWarnMissed++
+			case SeverityError:
+				result.NumErrorMissed[verbosity]++
+			case SeverityFatal:
+				result.NumFatalMissed++
+			}
 		} else {
-			numHit++
+			result.NumHitTotal++
+			switch v.Severity {
+			case SeverityInfo:
+				result.NumInfoHit[verbosity]++
+			case SeverityWarning:
+				result.NumWarnHit++
+			case SeverityError:
+				result.NumErrorHit[verbosity]++
+			case SeverityFatal:
+				result.NumFatalHit++
+			}
 		}
 	}
-
-	return float64(numHit) / float64(len(sm)), float64(numMissed) / float64(len(sm))
+	result.PercentHitTotal = float64(result.NumHitTotal) / float64(result.NumHitTotal+result.NumMissedTotal) * 100
+	for k, v := range result.NumInfoHit {
+		result.PercentInfoHit[k] = float64(v) / float64(result.NumInfoHit[k]+result.NumInfoMissed[k]) * 100
+	}
+	for k := range result.NumInfoMissed {
+		result.PercentInfoHit[k] = float64(result.NumInfoHit[k]) / float64(result.NumInfoHit[k]+result.NumInfoMissed[k]) * 100
+	}
+	result.PercentWarnHit = float64(result.NumWarnHit) / float64(result.NumWarnHit+result.NumWarnMissed) * 100
+	for k, v := range result.NumErrorHit {
+		result.PercentErrorHit[k] = float64(v) / float64(result.NumErrorHit[k]+result.NumErrorMissed[k]) * 100
+	}
+	for k := range result.NumErrorMissed {
+		result.PercentErrorHit[k] = float64(result.NumErrorHit[k]) / float64(result.NumErrorHit[k]+result.NumErrorMissed[k]) * 100
+	}
+	result.PercentFatalHit = float64(result.NumFatalHit) / float64(result.NumFatalHit+result.NumFatalMissed) * 100
+	return result
 }
 
 type MatchEntry struct {

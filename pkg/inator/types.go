@@ -9,12 +9,36 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+type Severity int32
+
+const (
+	SeverityInfo Severity = iota
+	SeverityWarning
+	SeverityError
+	SeverityFatal
+)
+
+func (s Severity) String() string {
+	switch s {
+	case SeverityInfo:
+		return "I"
+	case SeverityWarning:
+		return "W"
+	case SeverityError:
+		return "E"
+	case SeverityFatal:
+		return "F"
+	default:
+		return "?"
+	}
+}
+
 type LogStatement struct {
-	SourceFile   string `json:"sourceFile"`
-	LineNumber   int    `json:"lineNumber"`
-	Severity     int32  `json:"severity"`
-	Verbosity    *int   `json:"verbosity,omitempty"`
-	FormatString string `json:"formatString,omitempty"`
+	SourceFile   string   `json:"sourceFile"`
+	LineNumber   int      `json:"lineNumber"`
+	Severity     Severity `json:"severity"`
+	Verbosity    *int     `json:"verbosity,omitempty"`
+	FormatString string   `json:"formatString,omitempty"`
 }
 
 type ParsedLog struct {

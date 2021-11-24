@@ -64,14 +64,18 @@ func LoadSearchList(filename string) (SearchList, error) {
 	return list, nil
 }
 
-func (s SearchList) GenerateSearchMap() (sm SearchMap, collisions []*LogStatement) {
+func (s SearchList) GenerateSearchMap() (sm SearchMap, collisions map[string][]*LogStatement) {
+	collisions = make(map[string][]*LogStatement)
 	sm = SearchMap{}
 	for _, stmt := range s {
 		fp := stmt.Fingerprint()
-		if _, ok := sm[fp]; !ok {
+		if existing, ok := sm[fp]; !ok {
 			sm[fp] = stmt
 		} else {
-			collisions = append(collisions, stmt)
+			if _, ok := collisions[fp]; !ok {
+				collisions[fp] = []*LogStatement{existing}
+			}
+			collisions[fp] = append(collisions[fp], stmt)
 		}
 	}
 	return
@@ -118,8 +122,8 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 	wg.Add(len(packagesWithLog))
 	logStatements := make(chan *LogStatement, len(packagesWithLog))
 
-	for i, pkgWithLog := range packagesWithLog {
-		go func(i int, pkgWithLog *internalPackage) {
+	for _, pkgWithLog := range packagesWithLog {
+		go func(pkgWithLog *internalPackage) {
 			defer wg.Done()
 			fileset := token.NewFileSet()
 			for _, file := range pkgWithLog.GoFiles {
@@ -213,7 +217,7 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 							stmt := LogStatement{
 								SourceFile:   relPath,
 								LineNumber:   fileset.Position(call.Pos()).Line,
-								Severity:     meta.Severity,
+								Severity:     Severity(meta.Severity),
 								FormatString: stringLiteralFmtArg,
 							}
 							logStatements <- &stmt
@@ -261,7 +265,7 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 							stmt := LogStatement{
 								SourceFile:   relPath,
 								LineNumber:   fileset.Position(call.Pos()).Line,
-								Severity:     meta.Severity, // in practice, this is always 0
+								Severity:     Severity(meta.Severity), // in practice, this is always 0
 								Verbosity:    verbosity,
 								FormatString: stringLiteralFmtArg,
 							}
@@ -272,7 +276,7 @@ func Search(jsonObjects []string) <-chan *LogStatement {
 					})
 				}
 			}
-		}(i, pkgWithLog)
+		}(pkgWithLog)
 	}
 	go func() {
 		wg.Wait()
