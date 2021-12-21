@@ -263,7 +263,10 @@ func Match(sm SearchMap, archive string, opts ...MatchOption) (MatchResults, err
 	if len(channelGroups) == 1 {
 		s = ""
 	}
-	info, _ := os.Lstat(archive)
+	info, err := os.Lstat(archive)
+	if err != nil {
+		return MatchResults{}, err
+	}
 	fmt.Printf("Processing %.2fGB archive in %d chunk%s using %d workers\n",
 		float64(info.Size())/1024.0/1024.0/1024.0,
 		len(channelGroups), s, workerCount)
